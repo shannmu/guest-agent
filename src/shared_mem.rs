@@ -57,6 +57,7 @@ pub struct VcpuQosData {
     /// CLOCK_MONOTONIC timestamp (ns) at the time of collection.
     pub timestamp_ns: u64,
     /// Deadline miss count aggregated over the last collection epoch.
+    /// PSI source uses this field for QoS in fixed-point PPM (1_000_000 == 100% stall).
     pub deadline_miss_count: u64,
     /// Maximum deadline lateness (ns) observed in the last epoch.
     /// Negative values are clamped to 0 by the collector.

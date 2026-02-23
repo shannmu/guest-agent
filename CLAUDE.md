@@ -15,5 +15,47 @@
 - Qos反馈能力
   - 需要使用用户态高精度定时器，触发时间为参数
     用于触发QoS收集与写入共享内存
+  - Qos收集，通过ebpf, /proc/文件系统等多种方式进行，定义一个统一的trait，具体的Qos则通过实现trait
 
+## FIXME List
+- [x] 现在的QoS反馈能力的高精度定时器是通过loop实现的，而不是真正的定时器触发，需要修复该问题
+- [x] 如果你用 it_interval=interval，timerfd 的周期触发本身很稳，但用户态采集的耗时会造成“采样时刻抖动”。
+更关键的是很多采集希望对齐到整秒/整 100ms（方便聚合、画图、对齐其他数据源）。
+你可以用 timerfd_settime 的 TFD_TIMER_ABSTIME + 每次设定下一个 deadline（或初始化一次对齐到边界的 it_value）。
+典型做法（思路）：
+取当前 CLOCK_MONOTONIC（或 CLOCK_REALTIME，看你要不要受系统时间调整影响）
+计算下一个“对齐边界”时刻（比如下一秒）
+TFD_TIMER_ABSTIME 设一次性触发
+每次触发后，deadline += interval，再设下一次
+这样即使采集偶尔慢了一点，也不会长期漂移。
+- [x] PSI QoS实现
+```
+# 如何计算 QoS（基于 cgroup v2 的 CPU PSI）
+1. 读取 GNU Radio所在的 cgroup文件，查看其被固定在哪个CPU
+
+2. 读取 GNU Radio 所在 cgroup 的文件：
+
+   /sys/fs/cgroup/<gnuradio_cgroup>/cpu.pressure
+
+3. 从文件第一行（以 `some` 开头）中取出 `total` 的数值：
+
+   some ... total=<total_us>
+
+   其中 `total_us` 是累计的 CPU stall 时间，单位为微秒（µs）。
+
+4. 设定采样周期（例如 50ms 或 100ms）。每次采样时同时记录：
+   - 当前时间戳 T（用单调时钟，单位 µs）
+   - 当前 total 值 P（单位 µs）
+
+5. 用相邻两次采样计算：
+
+   Δt     = T2 - T1  
+   Δstall = P2 - P1
+
+6. 计算 stall 比例并得到 QoS：
+
+  stall_ratio = Δstall / Δt  
+  QoS = min(1, stall_ratio)
+
+QoS 的取值范围是 0~1；越接近 0 表示任务越少因 CPU 竞争而被阻塞。
 ```

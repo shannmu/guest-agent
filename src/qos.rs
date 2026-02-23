@@ -11,7 +11,10 @@
 
 use crate::shared_mem::{SharedMem, VcpuQosData};
 use anyhow::Result;
-use std::time::{Duration, Instant};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ─────────────────────── public data types ───────────────────────────────────
 
@@ -19,6 +22,9 @@ use std::time::{Duration, Instant};
 pub struct VcpuStat {
     pub vcpu_id: usize,
     /// Deadline misses observed since the last collection tick.
+    ///
+    /// For PSI-based sources this field carries QoS as fixed-point PPM
+    /// (1_000_000 == 100% stall).
     pub deadline_miss_count: u64,
     /// Maximum deadline lateness (ns) in the same window; 0 if none.
     pub max_lateness_ns: u64,
@@ -75,15 +81,108 @@ impl PressureSource for StubPressureSource {
     }
 }
 
+// ───────────────────────────── PSI source ───────────────────────────────────
+
+/// PSI-based QoS source backed by a cgroup v2 `cpu.pressure` file.
+pub struct PsiPressureSource {
+    vcpu_count: usize,
+    target_vcpus: Vec<usize>,
+    pressure_path: PathBuf,
+    last_total_us: Option<u64>,
+    last_ts_us: Option<u64>,
+}
+
+impl PsiPressureSource {
+    const QOS_PPM_SCALE: f64 = 1_000_000.0;
+
+    /// Build a PSI source from a cgroup path (directory) containing
+    /// `cpu.pressure`.
+    pub fn try_new(cgroup_path: impl Into<PathBuf>, vcpu_count: usize) -> Result<Self> {
+        let cgroup_path = cgroup_path.into();
+        let pressure_path = cgroup_path.join("cpu.pressure");
+        if !pressure_path.exists() {
+            anyhow::bail!("PSI cpu.pressure not found at {}", pressure_path.display());
+        }
+
+        let cpuset_path = cgroup_path.join("cpuset.cpus");
+        if !cpuset_path.exists() {
+            anyhow::bail!("cpuset.cpus not found at {}", cpuset_path.display());
+        }
+
+        // Validate the first line can be parsed.
+        let _ = read_psi_total_us(&pressure_path)?;
+
+        let cpus_raw = std::fs::read_to_string(&cpuset_path)?;
+        let mut target_vcpus = parse_cpuset_cpus(&cpus_raw)?;
+        if target_vcpus.is_empty() {
+            anyhow::bail!("cpuset.cpus is empty");
+        }
+
+        let before = target_vcpus.len();
+        target_vcpus.retain(|&cpu| cpu < vcpu_count);
+        if target_vcpus.is_empty() {
+            anyhow::bail!(
+                "cpuset.cpus lists CPUs outside vCPU range (count={vcpu_count})"
+            );
+        }
+        if target_vcpus.len() != before {
+            log::warn!(
+                "cpuset.cpus has CPUs outside vCPU range (count={vcpu_count}); ignoring them"
+            );
+        }
+
+        Ok(Self {
+            vcpu_count,
+            target_vcpus,
+            pressure_path,
+            last_total_us: None,
+            last_ts_us: None,
+        })
+    }
+}
+
+impl PressureSource for PsiPressureSource {
+    fn collect(&mut self) -> Result<Vec<VcpuStat>> {
+        let now_us = monotonic_us();
+        let total_us = read_psi_total_us(&self.pressure_path)?;
+
+        let qos_ppm = match (self.last_total_us, self.last_ts_us) {
+            (Some(prev_total), Some(prev_ts)) => {
+                let delta_t = now_us.saturating_sub(prev_ts);
+                let delta_stall = total_us.saturating_sub(prev_total);
+                if delta_t == 0 {
+                    0
+                } else {
+                    let ratio = (delta_stall as f64 / delta_t as f64).min(1.0);
+                    (ratio * Self::QOS_PPM_SCALE).round() as u64
+                }
+            }
+            _ => 0,
+        };
+
+        self.last_total_us = Some(total_us);
+        self.last_ts_us = Some(now_us);
+
+        Ok(self
+            .target_vcpus
+            .iter()
+            .copied()
+            .map(|id| VcpuStat {
+                vcpu_id: id,
+                deadline_miss_count: qos_ppm,
+                max_lateness_ns: 0,
+            })
+            .collect())
+    }
+}
+
 // ────────────────────────── QosCollector ─────────────────────────────────────
 
 /// Drives the high-precision collection timer and writes data into shared
 /// memory.
 ///
-/// Uses `std::thread::sleep` (which wraps `nanosleep(2)`) as the high-
-/// precision user-space timer mandated by the design document.  The sleep
-/// duration is adjusted each tick to compensate for collection overhead so
-/// that the effective interval stays close to the configured value.
+/// Uses Linux `timerfd` as the high-precision user-space timer mandated by the
+/// design document.
 pub struct QosCollector {
     shm: SharedMem,
     interval: Duration,
@@ -108,21 +207,13 @@ impl QosCollector {
     /// Run the collection loop.  Blocks indefinitely.
     pub fn run(&mut self) -> Result<()> {
         log::info!("QoS loop running (interval={:?})", self.interval);
+        let mut timer = TimerFd::new(self.interval)?;
         loop {
-            let tick_start = Instant::now();
-
-            self.tick()?;
-
-            // Compensate for collection overhead to keep the interval accurate.
-            let elapsed = tick_start.elapsed();
-            if let Some(remaining) = self.interval.checked_sub(elapsed) {
-                std::thread::sleep(remaining);
-            } else {
-                log::warn!(
-                    "collection overran interval by {:?}",
-                    elapsed - self.interval
-                );
+            let expirations = timer.wait()?;
+            if expirations > 1 {
+                log::warn!("collection missed {expirations} ticks");
             }
+            self.tick()?;
         }
     }
 
@@ -152,8 +243,245 @@ impl QosCollector {
 
 /// Returns `CLOCK_MONOTONIC` in nanoseconds via a direct libc call.
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: ts is a valid out-pointer; CLOCK_MONOTONIC always succeeds.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+fn monotonic_us() -> u64 {
+    monotonic_ns() / 1_000
+}
+
+fn read_psi_total_us(path: &Path) -> Result<u64> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line)?;
+    parse_psi_total_us(&line)
+}
+
+fn parse_psi_total_us(line: &str) -> Result<u64> {
+    for token in line.split_whitespace() {
+        if let Some(total) = token.strip_prefix("total=") {
+            return total
+                .parse::<u64>()
+                .map_err(|err| anyhow::anyhow!("invalid PSI total value: {err}"));
+        }
+    }
+    anyhow::bail!("PSI total field not found")
+}
+
+fn parse_cpuset_cpus(content: &str) -> Result<Vec<usize>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("cpuset.cpus is empty");
+    }
+
+    let mut cpus = std::collections::BTreeSet::new();
+    for token in trimmed.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = token.split_once('-') {
+            let start = start
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| anyhow::anyhow!("invalid cpuset cpu '{start}': {err}"))?;
+            let end = end
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| anyhow::anyhow!("invalid cpuset cpu '{end}': {err}"))?;
+            if start > end {
+                anyhow::bail!("invalid cpuset range {start}-{end}");
+            }
+            for cpu in start..=end {
+                cpus.insert(cpu);
+            }
+        } else {
+            let cpu = token
+                .parse::<usize>()
+                .map_err(|err| anyhow::anyhow!("invalid cpuset cpu '{token}': {err}"))?;
+            cpus.insert(cpu);
+        }
+    }
+
+    Ok(cpus.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_cpuset_cpus, parse_psi_total_us};
+
+    #[test]
+    fn parse_psi_total_us_ok() {
+        let line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=123456";
+        let total = parse_psi_total_us(line).expect("parse should succeed");
+        assert_eq!(total, 123456);
+    }
+
+    #[test]
+    fn parse_psi_total_us_missing() {
+        let line = "some avg10=0.00 avg60=0.00 avg300=0.00";
+        let err = parse_psi_total_us(line).unwrap_err().to_string();
+        assert!(err.contains("PSI total field not found"));
+    }
+
+    #[test]
+    fn parse_psi_total_us_invalid() {
+        let line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=oops";
+        let err = parse_psi_total_us(line).unwrap_err().to_string();
+        assert!(err.contains("invalid PSI total value"));
+    }
+
+    #[test]
+    fn parse_cpuset_cpus_single() {
+        let cpus = parse_cpuset_cpus("2").expect("parse should succeed");
+        assert_eq!(cpus, vec![2]);
+    }
+
+    #[test]
+    fn parse_cpuset_cpus_ranges() {
+        let cpus = parse_cpuset_cpus("0-2,4,6-7").expect("parse should succeed");
+        assert_eq!(cpus, vec![0, 1, 2, 4, 6, 7]);
+    }
+
+    #[test]
+    fn parse_cpuset_cpus_invalid_range() {
+        let err = parse_cpuset_cpus("3-1").unwrap_err().to_string();
+        assert!(err.contains("invalid cpuset range"));
+    }
+}
+
+// ───────────────────────────── timerfd ──────────────────────────────────────
+
+struct TimerFd {
+    fd: i32,
+    interval: Duration,
+    next_deadline_ns: u64,
+}
+
+impl TimerFd {
+    fn new(interval: Duration) -> Result<Self> {
+        if interval.is_zero() {
+            anyhow::bail!("interval must be non-zero");
+        }
+        // SAFETY: timerfd_create returns a new fd or -1 on error.
+        let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
+        if fd < 0 {
+            anyhow::bail!("timerfd_create failed: {}", std::io::Error::last_os_error());
+        }
+
+        let interval_ns = duration_to_ns(interval)?;
+        let now_ns = monotonic_ns();
+        let next_deadline_ns = align_next_deadline(now_ns, interval_ns);
+
+        let mut timer = Self {
+            fd,
+            interval,
+            next_deadline_ns,
+        };
+        if let Err(err) = timer.arm_absolute_deadline(next_deadline_ns) {
+            // SAFETY: close a valid fd.
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+
+        Ok(timer)
+    }
+
+    fn wait(&mut self) -> Result<u64> {
+        let mut expirations: u64 = 0;
+        let mut read_bytes = 0;
+        let target = std::mem::size_of::<u64>();
+        let buf = &mut expirations as *mut u64 as *mut u8;
+
+        while read_bytes < target {
+            // SAFETY: buffer is valid and sized for u64.
+            let ptr = unsafe { buf.add(read_bytes) } as *mut libc::c_void;
+            let rc = unsafe { libc::read(self.fd, ptr, target - read_bytes) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                anyhow::bail!("timerfd read failed: {err}");
+            }
+            read_bytes += rc as usize;
+        }
+
+        let now_ns = monotonic_ns();
+        let interval_ns = duration_to_ns(self.interval)?;
+        let mut missed = 0_u64;
+
+        while self.next_deadline_ns <= now_ns {
+            self.next_deadline_ns = self.next_deadline_ns.saturating_add(interval_ns);
+            missed = missed.saturating_add(1);
+        }
+
+        self.arm_absolute_deadline(self.next_deadline_ns)?;
+
+        Ok(missed.max(expirations))
+    }
+
+    fn arm_absolute_deadline(&self, deadline_ns: u64) -> Result<()> {
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: ns_to_timespec(deadline_ns),
+        };
+
+        // SAFETY: valid fd and itimerspec pointer.
+        let rc = unsafe {
+            libc::timerfd_settime(
+                self.fd,
+                libc::TFD_TIMER_ABSTIME,
+                &spec,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("timerfd_settime failed: {err}");
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for TimerFd {
+    fn drop(&mut self) {
+        // SAFETY: fd created by timerfd_create.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+fn duration_to_ns(duration: Duration) -> Result<u64> {
+    let secs = duration.as_secs();
+    let nanos = duration.subsec_nanos() as u64;
+    let base = secs
+        .checked_mul(1_000_000_000)
+        .and_then(|v| v.checked_add(nanos))
+        .ok_or_else(|| anyhow::anyhow!("interval too large to represent in ns"))?;
+    Ok(base)
+}
+
+fn ns_to_timespec(ns: u64) -> libc::timespec {
+    libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    }
+}
+
+fn align_next_deadline(now_ns: u64, interval_ns: u64) -> u64 {
+    let now = now_ns as u128;
+    let interval = interval_ns as u128;
+    let next = (now / interval + 1) * interval;
+    next.min(u128::from(u64::MAX)) as u64
 }
