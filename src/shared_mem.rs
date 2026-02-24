@@ -1,80 +1,33 @@
 //! Shared memory interface with the host via `/dev/pvsched_guest`.
 //!
-//! The kernel module `pvsched_guest` exposes the shared region through a
-//! `mmap(2)`-able character device.  This module owns the mapping and provides
-//! typed accessors for the guest-writable area.
-//!
-//! # Memory layout
-//!
-//! ```text
-//! ┌─────────────────────────────┐  offset 0
-//! │      SharedMemHeader        │  written by host / kernel module (read-only)
-//! ├─────────────────────────────┤  offset = header.guest_area_offset
-//! │         GuestArea           │  written by this agent
-//! │   vcpu_count: u32           │
-//! │   vcpu_data[MAX_VCPUS]      │
-//! ├─────────────────────────────┤  offset = header.host_area_offset
-//! │          HostArea           │  written by host (read-only for guest)
-//! └─────────────────────────────┘
-//! ```
+//! Layout is defined by `pvsched.h` (struct pvsched_shared_mem).
 
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-/// Magic number placed by the host in [`SharedMemHeader::magic`].
-/// Must match the kernel module definition.
-pub const SHARED_MEM_MAGIC: u32 = 0x5053_4348; // 'PSCH'
+/// Maximum number of vCPUs supported by the ABI.
+pub const PVSCHED_MAX_VCPU: usize = 16;
 
-/// Maximum number of vCPUs supported in the shared area.
-pub const MAX_VCPUS: usize = 128;
+/// Scale factor that maps [0.0, 1.0] to [0, PVSCHED_PRESSURE_SCALE].
+pub const PVSCHED_PRESSURE_SCALE: u64 = 1024;
 
-// ──────────────────────────── memory layout types ────────────────────────────
+// ─────────────────────────── ABI structs ────────────────────────────────────
 
-/// Header written by the host / kernel module.  The guest treats this as
-/// read-only after the initial validation in [`SharedMem::init_guest_area`].
 #[repr(C)]
-pub struct SharedMemHeader {
-    /// Must equal [`SHARED_MEM_MAGIC`].
-    pub magic: u32,
-    pub version: u32,
-    /// Byte offset of [`GuestArea`] from the start of the mapping.
-    pub guest_area_offset: u32,
-    pub guest_area_size: u32,
-    /// Byte offset of the host-writable area (read-only for guest).
-    pub host_area_offset: u32,
-    pub host_area_size: u32,
-    pub _reserved: [u8; 40],
+pub struct PvschedInfo {
+    pub qos_pressure: AtomicU64,
+    pub update_seq: AtomicU64,
+    pub tokens: AtomicI64,
 }
 
-/// Per-vCPU QoS data written by this agent into the shared area.
-///
-/// Fields are updated atomically per-vCPU; the host reads them after
-/// observing the release fence in [`SharedMem::write_vcpu_qos`].
 #[repr(C)]
-pub struct VcpuQosData {
-    /// CLOCK_MONOTONIC timestamp (ns) at the time of collection.
-    pub timestamp_ns: u64,
-    /// QoS pressure ratio in [0.0, 1.0].
-    pub pressure: f64,
-    pub _reserved: [u8; 16],
-}
-
-impl Default for VcpuQosData {
-    fn default() -> Self {
-        // SAFETY: all-zero is valid for this plain-data struct.
-        unsafe { std::mem::zeroed() }
-    }
-}
-
-/// Guest-writable region.
-#[repr(C)]
-pub struct GuestArea {
-    /// Number of vCPUs actually present; set during initialisation.
-    pub vcpu_count: u32,
-    pub _pad: [u8; 60],
-    pub vcpu_data: [VcpuQosData; MAX_VCPUS],
+pub struct PvschedSharedMem {
+    pub epoch: AtomicU32,
+    pub tgid: libc::pid_t,
+    pub vcpu_num: u32,
+    pub info: [PvschedInfo; 0],
 }
 
 // ────────────────────────────── SharedMem ────────────────────────────────────
@@ -98,7 +51,7 @@ impl SharedMem {
             .with_context(|| format!("failed to open {dev_path}"))?;
 
         let fd = file.as_raw_fd();
-        let size = Self::probe_size(fd);
+        let size = Self::probe_size();
 
         // SAFETY: standard mmap call; error is checked below.
         let ptr = unsafe {
@@ -123,72 +76,49 @@ impl SharedMem {
         Ok(Self { ptr: ptr as *mut u8, size })
     }
 
-    /// Validate the shared-memory header and zero-initialise the guest area.
-    ///
-    /// Must be called once before any [`write_vcpu_qos`] calls.
+    /// Validate shared memory metadata written by the host.
     pub fn init_guest_area(&mut self) -> Result<()> {
-        let magic = self.header().magic;
-        if magic != SHARED_MEM_MAGIC {
-            anyhow::bail!(
-                "bad shared-memory magic: 0x{magic:08x} (expected 0x{SHARED_MEM_MAGIC:08x})"
-            );
+        let vcpu_count = self.vcpu_count();
+        if !(1..=PVSCHED_MAX_VCPU).contains(&vcpu_count) {
+            anyhow::bail!("invalid vcpu_num in shared memory: {vcpu_count}");
         }
-
-        let vcpu_count = detect_vcpu_count();
-        let area = self.guest_area_mut();
-        area.vcpu_count = vcpu_count as u32;
-        for slot in area.vcpu_data.iter_mut() {
-            *slot = VcpuQosData::default();
-        }
-
-        // Ensure writes are visible to the host before it reads the area.
-        std::sync::atomic::fence(Ordering::SeqCst);
-
-        log::info!("guest area initialised (vcpu_count={vcpu_count})");
         Ok(())
     }
 
-    /// Returns the number of vCPUs recorded during initialisation.
+    /// Returns the number of vCPUs recorded by the host.
     pub fn vcpu_count(&self) -> usize {
-        self.guest_area().vcpu_count as usize
+        // SAFETY: mapping starts with pvsched_shared_mem.
+        let mem = unsafe { &*(self.ptr as *const PvschedSharedMem) };
+        mem.vcpu_num as usize
     }
 
-    /// Write QoS data for one vCPU.  Silently ignored for out-of-range IDs.
-    pub fn write_vcpu_qos(&mut self, vcpu_id: usize, data: VcpuQosData) {
-        if vcpu_id >= MAX_VCPUS {
+    /// Write QoS pressure for one vCPU. Silently ignored for out-of-range IDs.
+    ///
+    /// Update qos_pressure and bump update_seq, as required by the ABI contract.
+    pub fn write_vcpu_pressure(&mut self, vcpu_id: usize, pressure: f64) {
+        if vcpu_id >= PVSCHED_MAX_VCPU {
             return;
         }
-        self.guest_area_mut().vcpu_data[vcpu_id] = data;
-        // Release fence: host must observe all field writes before it reads
-        // timestamp_ns as a sequence counter.
-        std::sync::atomic::fence(Ordering::Release);
+        let mem = unsafe { &*(self.ptr as *const PvschedSharedMem) };
+        if vcpu_id >= mem.vcpu_num as usize {
+            return;
+        }
+
+        let clamped = pressure.clamp(0.0, 1.0);
+        let scaled = (clamped * PVSCHED_PRESSURE_SCALE as f64) as u64;
+        let info_ptr = unsafe { mem.info.as_ptr().add(vcpu_id) };
+        // SAFETY: info_ptr points inside the mapped shared memory region.
+        unsafe {
+            (*info_ptr).qos_pressure.store(scaled, Ordering::SeqCst);
+            (*info_ptr).update_seq.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
 
-    fn header(&self) -> &SharedMemHeader {
-        // SAFETY: the mapping always starts with the header (offset 0).
-        unsafe { &*(self.ptr as *const SharedMemHeader) }
-    }
-
-    fn guest_area(&self) -> &GuestArea {
-        let offset = self.header().guest_area_offset as usize;
-        // SAFETY: offset is within the mapping; validated by init_guest_area.
-        unsafe { &*(self.ptr.add(offset) as *const GuestArea) }
-    }
-
-    fn guest_area_mut(&mut self) -> &mut GuestArea {
-        let offset = self.header().guest_area_offset as usize;
-        // SAFETY: offset is within the mapping; validated by init_guest_area.
-        unsafe { &mut *(self.ptr.add(offset) as *mut GuestArea) }
-    }
-
-    /// Determine the mapping size.
-    ///
-    /// TODO: query via ioctl or a `/sys` attribute once the kernel module ABI
-    /// is finalised.  Falls back to a 64 KiB default for now.
-    fn probe_size(_fd: i32) -> usize {
-        64 * 1024
+    /// Mapping size as defined by the ABI (one 4 KiB page).
+    fn probe_size() -> usize {
+        4 * 1024
     }
 }
 
@@ -197,12 +127,4 @@ impl Drop for SharedMem {
         // SAFETY: ptr and size were set by a successful mmap call.
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.size) };
     }
-}
-
-// ─────────────────────────────── helpers ─────────────────────────────────────
-
-fn detect_vcpu_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
 }

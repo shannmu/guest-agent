@@ -9,7 +9,7 @@
 //! `metrics/dl_miss_count/`) is integrated via libbpf-rs or a perf-buffer
 //! mechanism.
 
-use crate::shared_mem::{SharedMem, VcpuQosData};
+use crate::shared_mem::SharedMem;
 use anyhow::Result;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -210,18 +210,10 @@ impl QosCollector {
     // ── private ──────────────────────────────────────────────────────────────
 
     fn tick(&mut self) -> Result<()> {
-        let now_ns = monotonic_ns();
         let samples = self.source.collect()?;
 
         for s in samples {
-            self.shm.write_vcpu_qos(
-                s.vcpu_id,
-                VcpuQosData {
-                    timestamp_ns: now_ns,
-                    pressure: s.pressure,
-                    _reserved: [0; 16],
-                },
-            );
+            self.shm.write_vcpu_pressure(s.vcpu_id, s.pressure);
         }
 
         Ok(())
