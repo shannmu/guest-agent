@@ -1,5 +1,5 @@
-//! QoS collection: high-precision timer loop that samples per-vCPU deadline
-//! pressure and writes the results into shared memory.
+//! QoS collection: high-precision timer loop that samples per-vCPU pressure
+//! and writes the results into shared memory.
 //!
 //! # Extension point
 //!
@@ -18,16 +18,11 @@ use std::time::Duration;
 
 // ─────────────────────── public data types ───────────────────────────────────
 
-/// Per-vCPU deadline pressure snapshot returned by a [`PressureSource`].
+/// Per-vCPU QoS pressure snapshot returned by a [`PressureSource`].
 pub struct VcpuStat {
     pub vcpu_id: usize,
-    /// Deadline misses observed since the last collection tick.
-    ///
-    /// For PSI-based sources this field carries QoS as fixed-point PPM
-    /// (1_000_000 == 100% stall).
-    pub deadline_miss_count: u64,
-    /// Maximum deadline lateness (ns) in the same window; 0 if none.
-    pub max_lateness_ns: u64,
+    /// Pressure ratio in [0.0, 1.0].
+    pub pressure: f64,
 }
 
 // ─────────────────────── PressureSource trait ────────────────────────────────
@@ -74,8 +69,7 @@ impl PressureSource for StubPressureSource {
         Ok((0..self.vcpu_count)
             .map(|id| VcpuStat {
                 vcpu_id: id,
-                deadline_miss_count: 0,
-                max_lateness_ns: 0,
+                pressure: 0.0,
             })
             .collect())
     }
@@ -93,8 +87,6 @@ pub struct PsiPressureSource {
 }
 
 impl PsiPressureSource {
-    const QOS_PPM_SCALE: f64 = 1_000_000.0;
-
     /// Build a PSI source from a cgroup path (directory) containing
     /// `cpu.pressure`.
     pub fn try_new(cgroup_path: impl Into<PathBuf>, vcpu_count: usize) -> Result<Self> {
@@ -146,18 +138,17 @@ impl PressureSource for PsiPressureSource {
         let now_us = monotonic_us();
         let total_us = read_psi_total_us(&self.pressure_path)?;
 
-        let qos_ppm = match (self.last_total_us, self.last_ts_us) {
+        let pressure = match (self.last_total_us, self.last_ts_us) {
             (Some(prev_total), Some(prev_ts)) => {
                 let delta_t = now_us.saturating_sub(prev_ts);
                 let delta_stall = total_us.saturating_sub(prev_total);
                 if delta_t == 0 {
-                    0
+                    0.0
                 } else {
-                    let ratio = (delta_stall as f64 / delta_t as f64).min(1.0);
-                    (ratio * Self::QOS_PPM_SCALE).round() as u64
+                    (delta_stall as f64 / delta_t as f64).min(1.0)
                 }
             }
-            _ => 0,
+            _ => 0.0,
         };
 
         self.last_total_us = Some(total_us);
@@ -169,8 +160,7 @@ impl PressureSource for PsiPressureSource {
             .copied()
             .map(|id| VcpuStat {
                 vcpu_id: id,
-                deadline_miss_count: qos_ppm,
-                max_lateness_ns: 0,
+                pressure,
             })
             .collect())
     }
@@ -228,9 +218,8 @@ impl QosCollector {
                 s.vcpu_id,
                 VcpuQosData {
                     timestamp_ns: now_ns,
-                    deadline_miss_count: s.deadline_miss_count,
-                    max_lateness_ns: s.max_lateness_ns,
-                    _reserved: [0; 8],
+                    pressure: s.pressure,
+                    _reserved: [0; 16],
                 },
             );
         }

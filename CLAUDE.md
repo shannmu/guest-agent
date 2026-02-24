@@ -59,3 +59,5 @@ TFD_TIMER_ABSTIME 设一次性触发
 
 QoS 的取值范围是 0~1；越接近 0 表示任务越少因 CPU 竞争而被阻塞。
 ```
+- [x] VcpuStat中, 只需要一个pressure变量, 不需要deadline_miss_count, deadline_lateness_ns等qos细节
+  pressure为一个0-1的无量纲量
