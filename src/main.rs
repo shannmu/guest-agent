@@ -9,7 +9,8 @@ use std::time::Duration;
 const PVSCHED_GUEST_DEV: &str = "/dev/pvsched_guest";
 
 const DEFAULT_QOS_INTERVAL_MS: u64 = 100;
-const DEFAULT_PSI_CGROUP: &str = "/sys/fs/cgroup/gnuradio";
+const DEFAULT_PSI_GNURADIO: &str = "/sys/fs/cgroup/gnuradio.slice/cpu.pressure";
+const DEFAULT_PSI_YAMCS: &str = "/sys/fs/cgroup/yamcs.slice/cpu.pressure";
 
 /// Internal flag appended by the watchdog when re-spawning itself as a worker.
 const WORKER_FLAG: &str = "--worker";
@@ -27,19 +28,27 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_QOS_INTERVAL_MS);
 
-    let psi_cgroup = args
+    let psi_gnuradio = args
         .iter()
         .position(|a| a == "--psi-cgroup")
         .and_then(|i| args.get(i + 1))
         .cloned()
         .or_else(|| std::env::var("PSI_CGROUP_PATH").ok())
-        .unwrap_or_else(|| DEFAULT_PSI_CGROUP.to_string());
+        .unwrap_or_else(|| DEFAULT_PSI_GNURADIO.to_string());
+
+    let psi_yamcs = args
+        .iter()
+        .position(|a| a == "--psi-cgroup-yamcs")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| std::env::var("PSI_CGROUP_PATH_YAMCS").ok())
+        .unwrap_or_else(|| DEFAULT_PSI_YAMCS.to_string());
 
     let interval = Duration::from_millis(interval_ms);
 
     if is_worker {
         log::info!("worker started (QoS interval={interval:?})");
-        run_worker(interval, psi_cgroup)
+        run_worker(interval, psi_gnuradio, psi_yamcs)
     } else {
         log::info!("watchdog started");
         daemon::run_watchdog()
@@ -47,14 +56,14 @@ fn main() -> Result<()> {
 }
 
 /// Worker entry point: initialises shared memory then drives the QoS loop.
-fn run_worker(interval: Duration, psi_cgroup: String) -> Result<()> {
+fn run_worker(interval: Duration, psi_gnuradio: String, psi_yamcs: String) -> Result<()> {
     let mut shm = shared_mem::SharedMem::open(PVSCHED_GUEST_DEV)?;
     shm.init_guest_area()?;
     let vcpu_count = shm.vcpu_count();
     log::info!("detected {vcpu_count} vCPU(s)");
 
     let mut collector = qos::QosCollector::new(shm, interval, vcpu_count);
-    match qos::PsiPressureSource::try_new(psi_cgroup, vcpu_count) {
+    match qos::PsiPressureSource::try_new(vec![psi_gnuradio, psi_yamcs], vcpu_count) {
         Ok(source) => {
             log::info!("using PSI QoS source");
             collector = collector.with_source(source);

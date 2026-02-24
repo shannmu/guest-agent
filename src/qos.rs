@@ -77,26 +77,81 @@ impl PressureSource for StubPressureSource {
 
 // ───────────────────────────── PSI source ───────────────────────────────────
 
-/// PSI-based QoS source backed by a cgroup v2 `cpu.pressure` file.
+/// PSI-based QoS source backed by one or more cgroup v2 `cpu.pressure` files.
 pub struct PsiPressureSource {
     vcpu_count: usize,
+    sources: Vec<PsiCgroupSource>,
+}
+
+impl PsiPressureSource {
+    /// Build a PSI source from one or more cgroup paths (directories or
+    /// explicit `cpu.pressure` file paths).
+    pub fn try_new(
+        cgroup_paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+        vcpu_count: usize,
+    ) -> Result<Self> {
+        let mut sources = Vec::new();
+        for path in cgroup_paths {
+            let path = path.into();
+            match PsiCgroupSource::try_new(path.clone(), vcpu_count) {
+                Ok(source) => sources.push(source),
+                Err(err) => {
+                    log::warn!(
+                        "PSI source disabled for {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        if sources.is_empty() {
+            anyhow::bail!("no valid PSI cgroup paths found");
+        }
+        Ok(Self { vcpu_count, sources })
+    }
+}
+
+impl PressureSource for PsiPressureSource {
+    fn collect(&mut self) -> Result<Vec<VcpuStat>> {
+        let mut per_vcpu: Vec<Option<f64>> = vec![None; self.vcpu_count];
+        for source in &mut self.sources {
+            let pressure = source.sample_pressure()?;
+            for &id in &source.target_vcpus {
+                let slot = &mut per_vcpu[id];
+                *slot = Some(match *slot {
+                    Some(existing) => existing.max(pressure),
+                    None => pressure,
+                });
+            }
+        }
+
+        Ok(per_vcpu
+            .into_iter()
+            .enumerate()
+            .filter_map(|(id, pressure)| {
+                pressure.map(|pressure| VcpuStat {
+                    vcpu_id: id,
+                    pressure,
+                })
+            })
+            .collect())
+    }
+}
+
+struct PsiCgroupSource {
     target_vcpus: Vec<usize>,
     pressure_path: PathBuf,
     last_total_us: Option<u64>,
     last_ts_us: Option<u64>,
 }
 
-impl PsiPressureSource {
-    /// Build a PSI source from a cgroup path (directory) containing
-    /// `cpu.pressure`.
-    pub fn try_new(cgroup_path: impl Into<PathBuf>, vcpu_count: usize) -> Result<Self> {
-        let cgroup_path = cgroup_path.into();
-        let pressure_path = cgroup_path.join("cpu.pressure");
+impl PsiCgroupSource {
+    fn try_new(cgroup_path: PathBuf, vcpu_count: usize) -> Result<Self> {
+        let (cgroup_dir, pressure_path) = resolve_cgroup_paths(&cgroup_path)?;
         if !pressure_path.exists() {
             anyhow::bail!("PSI cpu.pressure not found at {}", pressure_path.display());
         }
 
-        let cpuset_path = cgroup_path.join("cpuset.cpus");
+        let cpuset_path = cgroup_dir.join("cpuset.cpus");
         if !cpuset_path.exists() {
             anyhow::bail!("cpuset.cpus not found at {}", cpuset_path.display());
         }
@@ -124,17 +179,14 @@ impl PsiPressureSource {
         }
 
         Ok(Self {
-            vcpu_count,
             target_vcpus,
             pressure_path,
             last_total_us: None,
             last_ts_us: None,
         })
     }
-}
 
-impl PressureSource for PsiPressureSource {
-    fn collect(&mut self) -> Result<Vec<VcpuStat>> {
+    fn sample_pressure(&mut self) -> Result<f64> {
         let now_us = monotonic_us();
         let total_us = read_psi_total_us(&self.pressure_path)?;
 
@@ -154,15 +206,7 @@ impl PressureSource for PsiPressureSource {
         self.last_total_us = Some(total_us);
         self.last_ts_us = Some(now_us);
 
-        Ok(self
-            .target_vcpus
-            .iter()
-            .copied()
-            .map(|id| VcpuStat {
-                vcpu_id: id,
-                pressure,
-            })
-            .collect())
+        Ok(pressure)
     }
 }
 
@@ -254,6 +298,20 @@ fn parse_psi_total_us(line: &str) -> Result<u64> {
         }
     }
     anyhow::bail!("PSI total field not found")
+}
+
+fn resolve_cgroup_paths(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    if let Some(name) = path.file_name() {
+        if name == "cpu.pressure" {
+            let cgroup_dir = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("cpu.pressure path has no parent"))?
+                .to_path_buf();
+            return Ok((cgroup_dir, path.to_path_buf()));
+        }
+    }
+
+    Ok((path.to_path_buf(), path.join("cpu.pressure")))
 }
 
 fn parse_cpuset_cpus(content: &str) -> Result<Vec<usize>> {
@@ -361,7 +419,7 @@ impl TimerFd {
         let now_ns = monotonic_ns();
         let next_deadline_ns = align_next_deadline(now_ns, interval_ns);
 
-        let mut timer = Self {
+        let timer = Self {
             fd,
             interval,
             next_deadline_ns,
